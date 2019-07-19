@@ -1,10 +1,11 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Ldap.Asn1.Type where
 
 import Data.ByteString (ByteString)
 import Data.Int (Int8, Int32)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Text (Text)
-
 
 -- | Message envelope. (Section 4.1.1.)
 data LdapMessage op = LdapMessage
@@ -117,11 +118,29 @@ newtype AttributeList = AttributeList [Attribute]
 newtype PartialAttributeList = PartialAttributeList [PartialAttribute]
     deriving (Show, Eq)
 
-newtype Controls = Controls [Control]
+newtype Controls = Controls { unControls :: [Control] }
     deriving (Show, Eq)
 
-data Control = Control !LdapOid !Bool !(Maybe ByteString)
+data Control = Control !LdapOid !Bool !(Maybe ControlValue)
     deriving (Show, Eq)
+
+data ControlValue
+  = PagedResultsCV !PagedResultsControlValue
+  | UnknownCV !ByteString
+  deriving (Eq, Show)
+
+-- | LDAP Control Extension for Simple Paged Results Manipulation ([RFC2696]).
+data PagedResultsControlValue = PagedResultsControlValue
+  { pagedResultSize :: !Int32
+  , pagedResultCookie :: !ByteString
+  } deriving (Eq, Show)
+
+pagedResultsControl :: PagedResultsControlValue -> Control
+pagedResultsControl value =
+  Control
+    (LdapOid "1.2.840.113556.1.4.319")
+    False
+    (Just . PagedResultsCV $ value)
 
 data LdapResult = LdapResult !ResultCode !LdapDn !LdapString !(Maybe ReferralUris)
     deriving (Show, Eq)

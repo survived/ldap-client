@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE TupleSections, LambdaCase, RecordWildCards, OverloadedStrings #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE NamedFieldPuns #-}
 -- | This module is intended to be imported qualified
@@ -30,6 +31,7 @@ module Ldap.Client
   , Type.Scope(..)
   , scope
   , size
+  , enablePaging
   , time
   , typesOnly
   , Type.DerefAliases(..)
@@ -67,16 +69,18 @@ import           Control.Concurrent.STM (atomically, throwSTM)
 import           Control.Concurrent.STM.TMVar (putTMVar)
 import           Control.Concurrent.STM.TQueue (TQueue, newTQueueIO, writeTQueue, readTQueue)
 import           Control.Exception (Exception, Handler(..), bracket, throwIO, catch, catches)
-import           Control.Monad (forever)
+import           Control.Monad (forever, join)
 import qualified Data.ASN1.BinaryEncoding as Asn1
 import qualified Data.ASN1.Encoding as Asn1
 import qualified Data.ASN1.Error as Asn1
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Lazy as ByteString.Lazy
 import           Data.Foldable (asum)
-import           Data.Function (fix)
+import           Data.Function (fix, (&))
+import           Data.List (find)
 import           Data.List.NonEmpty (NonEmpty((:|)))
 import qualified Data.Map.Strict as Map
+import           Data.Maybe (fromJust)
 import           Data.Monoid (Endo(appEndo))
 import           Data.Text (Text)
 #if __GLASGOW_HASKELL__ < 710
@@ -88,7 +92,7 @@ import qualified Network.Connection as Conn
 import           Prelude hiding (compare)
 import qualified System.IO.Error as IO
 
-import           Ldap.Asn1.ToAsn1 (ToAsn1(toAsn1))
+import           Ldap.Asn1.ToAsn1 (ToAsn1(toAsn1), encode)
 import           Ldap.Asn1.FromAsn1 (FromAsn1, parseAsn1)
 import qualified Ldap.Asn1.Type as Type
 import           Ldap.Client.Internal
@@ -99,6 +103,7 @@ import           Ldap.Client.Search
   , Mod
   , scope
   , size
+  , enablePaging
   , time
   , typesOnly
   , derefAliases
@@ -186,7 +191,7 @@ insecureTlsSettings = Conn.TLSSettingsSimple
   , Conn.settingUseServerName = False
   }
 
-input :: FromAsn1 a => TQueue a -> Connection -> IO b
+input :: (Show a, FromAsn1 a) => TQueue a -> Connection -> IO b
 input inq conn = wrap . flip fix [] $ \loop chunks -> do
   chunk <- Conn.connectionGet conn 8192
   case ByteString.length chunk of
@@ -209,9 +214,7 @@ input inq conn = wrap . flip fix [] $ \loop chunks -> do
 output :: ToAsn1 a => TQueue a -> Connection -> IO b
 output out conn = wrap . forever $ do
   msg <- atomically (readTQueue out)
-  Conn.connectionPut conn (encode (toAsn1 msg))
- where
-  encode x = Asn1.encodeASN1' Asn1.DER (appEndo x [])
+  Conn.connectionPut conn (encode msg)
 
 dispatch
   :: Ldap
@@ -221,33 +224,55 @@ dispatch
 dispatch Ldap { client } inq outq =
   flip fix (Map.empty, 1) $ \loop (!req, !counter) ->
     loop =<< atomically (asum
-      [ do New new var <- readTQueue client
-           writeTQueue outq (Type.LdapMessage (Type.Id counter) new Nothing)
-           return (Map.insert (Type.Id counter) ([], var) req, counter + 1)
-      , do Type.LdapMessage mid op _
+      [ do New new controls var <- readTQueue client
+           writeTQueue outq (Type.LdapMessage (Type.Id counter) new controls)
+           return (Map.insert (Type.Id counter) ([], new, var) req, counter + 1)
+      , do Type.LdapMessage mid op controls
                <- readTQueue inq
-           res <- case op of
-             Type.BindResponse {}          -> done mid op req
-             Type.SearchResultEntry {}     -> saveUp mid op req
-             Type.SearchResultReference {} -> return req
-             Type.SearchResultDone {}      -> done mid op req
-             Type.ModifyResponse {}        -> done mid op req
-             Type.AddResponse {}           -> done mid op req
-             Type.DeleteResponse {}        -> done mid op req
-             Type.ModifyDnResponse {}      -> done mid op req
-             Type.CompareResponse {}       -> done mid op req
-             Type.ExtendedResponse {}      -> probablyDisconnect mid op req
-             Type.IntermediateResponse {}  -> saveUp mid op req
+           (res, counter) <- case op of
+             Type.BindResponse {}          -> (, counter) <$> done mid op req
+             Type.SearchResultEntry {}     -> (, counter) <$> saveUp mid op req
+             Type.SearchResultReference {} -> return (req, counter)
+             Type.SearchResultDone {}      -> lookForMore mid op controls req counter
+             Type.ModifyResponse {}        -> (, counter) <$> done mid op req
+             Type.AddResponse {}           -> (, counter) <$> done mid op req
+             Type.DeleteResponse {}        -> (, counter) <$> done mid op req
+             Type.ModifyDnResponse {}      -> (, counter) <$> done mid op req
+             Type.CompareResponse {}       -> (, counter) <$> done mid op req
+             Type.ExtendedResponse {}      -> (, counter) <$> probablyDisconnect mid op req
+             Type.IntermediateResponse {}  -> (, counter) <$> saveUp mid op req
            return (res, counter)
       ])
  where
   saveUp mid op res =
-    return (Map.adjust (\(stack, var) -> (op : stack, var)) mid res)
+    return (Map.adjust (\(stack, r, var) -> (op : stack, r, var)) mid res)
+
+  lookForMore mid op@Type.SearchResultDone{} (Just (Type.Controls controls)) res counter =
+    controls
+      &   find (\(Type.Control oid _ _) -> oid == Type.LdapOid "1.2.840.113556.1.4.319")
+      >>= (\(Type.Control _ _ value) -> case value of Just (Type.PagedResultsCV p) -> Just p; _ -> Nothing)
+      &   \case
+            Just Type.PagedResultsControlValue{..} ->
+              let (removed, res') = Map.updateLookupWithKey (\_ _ -> Nothing) mid res
+                  controls' = Type.Controls $ pure $ Type.pagedResultsControl $
+                    Type.PagedResultsControlValue
+                      1000
+                      pagedResultCookie
+              in  case removed of
+                    Just (stack, p, var)
+                      | not (ByteString.null pagedResultCookie) -> do
+                          writeTQueue outq (Type.LdapMessage (Type.Id counter) p (Just controls'))
+                          return (Map.insert (Type.Id counter) (stack, p, var) res', counter + 1)
+                    _ ->
+                      (,) <$> done mid op res <*> pure counter
+            _ -> (,) <$> done mid op res <*> pure counter
+  lookForMore mid op _ res counter =
+    (,) <$> done mid op res <*> pure counter
 
   done mid op req =
     case Map.lookup mid req of
       Nothing -> return req
-      Just (stack, var) -> do
+      Just (stack, _, var) -> do
         putTMVar var (op :| stack)
         return (Map.delete mid req)
 

@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase, RecordWildCards, OverloadedStrings #-}
 {-# LANGUAGE CPP #-}
 -- | This module contains convertions from ASN.1 to LDAP types.
 module Ldap.Asn1.FromAsn1
@@ -13,6 +14,11 @@ import           Control.Applicative (Applicative(..), Alternative(..), liftA2, 
 import           Control.Monad (MonadPlus(..), (>=>), guard)
 import           Data.ASN1.Types (ASN1)
 import qualified Data.ASN1.Types as Asn1
+import qualified Data.ASN1.BinaryEncoding as Asn1
+import qualified Data.ASN1.Encoding as Asn1
+import qualified Data.ASN1.Error as Asn1
+import qualified Data.ByteString.Lazy as ByteString.Lazy
+import           Data.Maybe (fromMaybe)
 import           Data.Foldable (asum)
 import           Data.List.NonEmpty (some1)
 import qualified Data.Text.Encoding as Text
@@ -56,8 +62,51 @@ instance FromAsn1 op =>  FromAsn1 (LdapMessage op) where
     Asn1.Start Asn1.Sequence <- next
     i  <- fromAsn1
     op <- fromAsn1
+    controls <- optional $ do
+      Asn1.Start (Asn1.Container Asn1.Context 0) <- next
+      controls <- Controls <$> many fromAsn1
+      Asn1.End (Asn1.Container Asn1.Context 0) <- next
+      return controls
     Asn1.End Asn1.Sequence <- next
-    return (LdapMessage i op Nothing)
+    return (LdapMessage i op controls)
+
+{- |
+@
+Control ::= SEQUENCE {
+  controlType             LDAPOID,
+  criticality             BOOLEAN DEFAULT FALSE,
+  controlValue            OCTET STRING OPTIONAL
+}
+@
+-}
+instance FromAsn1 Control where
+  fromAsn1 = do
+    Asn1.Start Asn1.Sequence <- next
+    ty <- fromAsn1
+    crit <- optional $ do
+      Asn1.Boolean v <- next
+      return v
+    value <- optional $ do
+      Asn1.OctetString v <- next
+      let asn1 = Asn1.decodeASN1 Asn1.BER (ByteString.Lazy.fromChunks [v])
+          parsed a = case ty of
+            LdapOid "1.2.840.113556.1.4.319" -> PagedResultsCV <$> parseAll fromAsn1 a
+            _ -> Nothing
+      case parsed <$> asn1 of
+        Right (Just a) -> return a
+        Right Nothing  -> return $ UnknownCV v
+        Left _         -> empty
+    Asn1.End Asn1.Sequence <- next
+    return $ Control ty (fromMaybe False crit) value
+
+instance FromAsn1 PagedResultsControlValue where
+  fromAsn1 = do
+    Asn1.Start Asn1.Sequence <- next
+    Asn1.IntVal size <- next
+    let pagedResultSize = fromIntegral size
+    Asn1.OctetString pagedResultCookie <- next
+    Asn1.End Asn1.Sequence <- next
+    return PagedResultsControlValue{..}
 
 {- |
 @
@@ -418,6 +467,11 @@ instance MonadPlus (Parser s) where
 
 parse :: Parser s a -> s -> Maybe (s, a)
 parse = unParser
+
+parseAll :: Parser [ASN1] a -> [ASN1] -> Maybe a
+parseAll p s = case parse p s of
+  Just ([], x) -> Just x
+  _ -> Nothing
 
 next :: Parser [s] s
 next = Parser (\s -> case s of [] -> Nothing; x : xs -> Just (xs, x))

@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, RecordWildCards #-}
 -- | This module contains convertions from LDAP types to ASN.1.
 --
 -- Various hacks are employed because "asn1-encoding" only encodes to DER, but
@@ -7,17 +7,20 @@
 -- eventually.
 module Ldap.Asn1.ToAsn1
   ( ToAsn1(toAsn1)
+  , encode
   ) where
 
 import           Data.ASN1.Types (ASN1, ASN1Class, ASN1Tag, ASN1ConstructionType)
 import qualified Data.ASN1.Types as Asn1
+import qualified Data.ASN1.BinaryEncoding as Asn1
+import qualified Data.ASN1.Encoding as Asn1
 import           Data.ByteString (ByteString)
 import           Data.Foldable (fold, foldMap)
 import           Data.List.NonEmpty (NonEmpty)
-import           Data.Maybe (maybe)
-import           Data.Monoid (Endo(Endo), (<>), mempty)
+import           Data.Maybe (Maybe(..), maybe)
+import           Data.Monoid (Endo(Endo, appEndo), (<>), mempty)
 import qualified Data.Text.Encoding as Text
-import           Prelude (Integer, (.), fromIntegral)
+import           Prelude (Integer, (.), fromIntegral, ($))
 
 import           Ldap.Asn1.Type
 
@@ -48,7 +51,7 @@ LDAPMessage ::= SEQUENCE {
 -}
 instance ToAsn1 op => ToAsn1 (LdapMessage op) where
   toAsn1 (LdapMessage i op mc) =
-    sequence (toAsn1 i <> toAsn1 op <> maybe mempty (context 0 . toAsn1) mc)
+    sequence (toAsn1 i <> toAsn1 op <> maybe mempty (context 0 . toAsn1 . unControls) mc)
 
 {- |
 @
@@ -155,14 +158,6 @@ instance ToAsn1 MatchingRuleId where
 
 {- |
 @
-Controls ::= SEQUENCE OF control Control
-@
--}
-instance ToAsn1 Controls where
-  toAsn1 (Controls cs) = sequence (toAsn1 cs)
-
-{- |
-@
 Control ::= SEQUENCE {
      controlType             LDAPOID,
      criticality             BOOLEAN DEFAULT FALSE,
@@ -171,11 +166,19 @@ Control ::= SEQUENCE {
 -}
 instance ToAsn1 Control where
   toAsn1 (Control t c v) =
-    sequence (fold
+    sequence $ fold
       [ toAsn1 t
       , single (Asn1.Boolean c)
-      , maybe mempty (single . Asn1.OctetString) v
-      ])
+      , case v of
+          Just (PagedResultsCV val) -> single . Asn1.OctetString . encode $ val
+          Just (UnknownCV val) -> single (Asn1.OctetString val)
+          Nothing -> mempty
+      ]
+
+instance ToAsn1 PagedResultsControlValue where
+  toAsn1 PagedResultsControlValue{..} = sequence
+     $  single (Asn1.IntVal (fromIntegral pagedResultSize))
+     <> single (Asn1.OctetString pagedResultCookie)
 
 {- |
 @
@@ -438,3 +441,6 @@ enum = single . Asn1.Enumerated
 
 single :: a -> Endo [a]
 single x = Endo (x :)
+
+encode :: ToAsn1 a => a -> ByteString
+encode x = Asn1.encodeASN1' Asn1.DER (appEndo (toAsn1 x) [])

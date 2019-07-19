@@ -17,6 +17,7 @@ module Ldap.Client.Internal
   , Request
   , raise
   , sendRequest
+  , sendExtendedRequest
   , Dn(..)
   , Attr(..)
   , AttrValue
@@ -52,8 +53,10 @@ newtype Ldap = Ldap
   { client  :: TQueue ClientMessage
   } deriving (Eq)
 
-data ClientMessage = New !Request !(TMVar (NonEmpty Type.ProtocolServerOp))
+data ClientMessage = New !Request !(Maybe Controls) !(TMVar (NonEmpty Type.ProtocolServerOp))
 type Request = Type.ProtocolClientOp
+type Control = Type.Control
+type Controls = Type.Controls
 type InMessage = Type.ProtocolServerOp
 type Response = NonEmpty InMessage
 
@@ -105,13 +108,19 @@ waitSTM :: Async a -> STM (Either ResponseError a)
 waitSTM (Async stm) = stm
 
 sendRequest :: Ldap -> (Response -> Either ResponseError a) -> Request -> STM (Async a)
-sendRequest l p msg =
+sendRequest l p msg = sendExtendedRequest l p msg Nothing
+
+sendExtendedRequest :: Ldap -> (Response -> Either ResponseError a) -> Request -> Maybe Controls -> STM (Async a)
+sendExtendedRequest l p msg controls =
   do var <- newEmptyTMVar
-     writeRequest l var msg
+     writeExtendedRequest l var msg controls
      return (Async (fmap p (readTMVar var)))
 
 writeRequest :: Ldap -> TMVar Response -> Request -> STM ()
-writeRequest Ldap { client } var msg = writeTQueue client (New msg var)
+writeRequest ldap var msg = writeExtendedRequest ldap var msg Nothing
+
+writeExtendedRequest :: Ldap -> TMVar Response -> Request -> Maybe Controls -> STM ()
+writeExtendedRequest Ldap { client } var msg controls = writeTQueue client (New msg controls var)
 
 raise :: Exception e => Either e a -> IO a
 raise = either throwIO return

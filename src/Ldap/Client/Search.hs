@@ -1,3 +1,4 @@
+{-# LANGUAGE RecordWildCards, OverloadedStrings #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE NamedFieldPuns #-}
 -- | <https://tools.ietf.org/html/rfc4511#section-4.5 Search> operation.
@@ -23,6 +24,7 @@ module Ldap.Client.Search
   , Type.Scope(..)
   , scope
   , size
+  , enablePaging
   , time
   , typesOnly
   , Type.DerefAliases(..)
@@ -83,11 +85,17 @@ searchAsyncSTM
   -> Filter
   -> [Attr]
   -> STM (Async [SearchEntry])
-searchAsyncSTM l base opts flt attributes =
-  let req = searchRequest base opts flt attributes in sendRequest l (searchResult req) req
+searchAsyncSTM l base (Mod m) flt attributes =
+  let req = searchRequest base search flt attributes
+      extendPageLimit n = Type.pagedResultsControl Type.PagedResultsControlValue
+        { Type.pagedResultSize = n
+        , Type.pagedResultCookie = ""
+        }
+      search = m defaultSearch
+  in  sendExtendedRequest l (searchResult req) req (Type.Controls . pure . extendPageLimit <$> _pageSize search)
 
-searchRequest :: Dn -> Mod Search -> Filter -> [Attr] -> Request
-searchRequest (Dn base) (Mod m) flt attributes =
+searchRequest :: Dn -> Search -> Filter -> [Attr] -> Request
+searchRequest (Dn base) Search{..} flt attributes =
   Type.SearchRequest (Type.LdapDn (Type.LdapString base))
                      _scope
                      _derefAliases
@@ -97,8 +105,6 @@ searchRequest (Dn base) (Mod m) flt attributes =
                      (fromFilter flt)
                      (Type.AttributeSelection (map (Type.LdapString . unAttr) attributes))
  where
-  Search { _scope, _derefAliases, _size, _time, _typesOnly } =
-    m defaultSearch
   fromFilter (Not x) = Type.Not (fromFilter x)
   fromFilter (And xs) = Type.And (fmap fromFilter xs)
   fromFilter (Or xs) = Type.Or (fmap fromFilter xs)
@@ -157,6 +163,7 @@ data Search = Search
   { _scope        :: !Type.Scope
   , _derefAliases :: !Type.DerefAliases
   , _size         :: !Int32
+  , _pageSize     :: !(Maybe Int32)
   , _time         :: !Int32
   , _typesOnly    :: !Bool
   } deriving (Show, Eq)
@@ -165,6 +172,7 @@ defaultSearch :: Search
 defaultSearch = Search
   { _scope        = Type.WholeSubtree
   , _size         = 0
+  , _pageSize     = Nothing
   , _time         = 0
   , _typesOnly    = False
   , _derefAliases = Type.NeverDerefAliases
@@ -178,6 +186,11 @@ scope x = Mod (\y -> y { _scope = x })
 -- No limit if the value is @0@ (default: @0@).
 size :: Int32 -> Mod Search
 size x = Mod (\y -> y { _size = x })
+
+-- | Turns on paged result extension.
+-- By default this extension is turned off.
+enablePaging :: Bool -> Mod Search
+enablePaging v = Mod (\y -> y { _pageSize = if v then Just 1000 else Nothing })
 
 -- | Maximum time (in seconds) allowed for the Search. No limit if the value
 -- is @0@ (default: @0@).
