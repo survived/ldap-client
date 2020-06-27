@@ -458,6 +458,8 @@ instance Monad (Parser s) where
   return x = Parser (\s -> return (s, x))
   Parser mx >>= k =
     Parser (mx >=> \(s', x) -> unParser (k x) s')
+
+instance MonadFail (Parser s) where
   fail _ = empty
 
 instance MonadPlus (Parser s) where
